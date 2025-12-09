@@ -1,68 +1,115 @@
 // api/webhook.js
-const linebot = require("linebot");
+// 不用 linebot，直接處理 LINE Webhook + 呼叫 OpenAI + 回 LINE
+
 const axios = require("axios");
 
-// 使用環境變數儲存敏感資訊（在 Vercel 後台設定）
-const bot = linebot({
-  channelId: process.env.LINE_CHANNEL_ID,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-});
+module.exports = async (req, res) => {
+  // 1) 給你測試用：用瀏覽器 GET /api/webhook 會看到這句
+  if (req.method !== "POST") {
+    return res.status(200).send("LINE webhook is running.");
+  }
 
-// 由 linebot 產生處理 LINE Webhook 的 middleware
-const parser = bot.parser();
+  // 2) 收集 POST body（Vercel 預設不幫我們 parse）
+  let body = "";
 
-// 收到訊息事件
-bot.on("message", async function (event) {
-  try {
-    const userText = event.message.text || "";
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
 
-    // 呼叫 OpenAI Chat Completions
-    const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
+  req.on("end", async () => {
+    try {
+      // 👉 Verify 時 body 可能是空的，或 events 是空陣列
+      if (!body) {
+        return res.status(200).send("OK");
+      }
+
+      const json = JSON.parse(body);
+      const events = json.events || [];
+
+      // 沒有事件（Verify 或健康檢查）一律回 OK
+      if (events.length === 0) {
+        return res.status(200).send("OK");
+      }
+
+      const event = events[0];
+
+      // 只處理「文字訊息」，其他類型直接回 OK
+      if (
+        !event ||
+        event.type !== "message" ||
+        !event.message ||
+        event.message.type !== "text"
+      ) {
+        return res.status(200).send("OK");
+      }
+
+      const userText = event.message.text;
+      const replyToken = event.replyToken;
+
+      // 預設回覆
+      let replyText = "我暫時無法回覆，請稍後再試～";
+
+      // 3) 呼叫 OpenAI 產生回覆文字
+      try {
+        const aiRes = await axios.post(
+          "https://api.openai.com/v1/chat/completions",
           {
-            role: "system",
-            content: "你是一個友善又專業的 LINE 客服機器人。"
+            model: "gpt-4o-mini",
+            messages: [
+              {
+                role: "system",
+                content: "你是一個親切又專業的 LINE 客服機器人。"
+              },
+              {
+                role: "user",
+                content: userText
+              }
+            ]
           },
           {
-            role: "user",
-            content: userText
+            headers: {
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+            }
           }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-        }
+        );
+
+        replyText =
+          aiRes.data.choices?.[0]?.message?.content || replyText;
+      } catch (e) {
+        console.error("OpenAI error:", e?.response?.data || e);
       }
-    );
 
-    const aiText =
-      response.data.choices?.[0]?.message?.content ||
-      "我現在有點忙碌，稍後再回覆你～";
+      // 4) 回傳訊息給 LINE 使用者
+      try {
+        await axios.post(
+          "https://api.line.me/v2/bot/message/reply",
+          {
+            replyToken,
+            messages: [
+              {
+                type: "text",
+                text: replyText
+              }
+            ]
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+            }
+          }
+        );
+      } catch (e) {
+        console.error("LINE reply error:", e?.response?.data || e);
+      }
 
-    // 回覆給使用者
-    await event.reply(aiText);
-  } catch (error) {
-    console.error("Error:", error?.response?.data || error);
-    try {
-      await event.reply("哎呀，系統剛剛打結了，等等再試看看 🙏");
+      // 5) 一律回 200 OK 給 LINE（很重要，避免 timeout）
+      return res.status(200).send("OK");
     } catch (e) {
-      console.error("Reply error:", e);
+      console.error("Handler error:", e);
+      // 就算錯誤，也要回 200，避免 LINE 一直重送
+      return res.status(200).send("OK");
     }
-  }
-});
-
-// 🔑 Vercel Serverless Function 入口
-module.exports = (req, res) => {
-  if (req.method === "POST") {
-    // 交給 linebot middleware 處理簽章驗證、事件分派
-    parser(req, res);
-  } else {
-    // 給你測試用的 GET
-    res.status(200).send("LINE webhook is running.");
-  }
+  });
 };
+
